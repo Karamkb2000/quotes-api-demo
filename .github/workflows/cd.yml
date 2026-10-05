@@ -1,0 +1,188 @@
+# ============================================================
+# CD — deploy quotes-api to the Linux server (manual trigger)
+#
+#   build -> rsync to a NEW release dir -> atomic symlink switch ->
+#   restart systemd + reload nginx -> health check via nginx (port 80) ->
+#   auto-rollback on failure -> tag/release ONLY if healthy
+#
+# Needs (Settings > Secrets and variables > Actions):
+#   secret   SSH_PRIVATE_KEY   private key of the 'deploy' user
+#   variable SERVER_HOST       server IP / hostname
+#   variable SERVER_USER       deploy
+# ============================================================
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to deploy and tag, e.g. v1.0.0"
+        required: true
+        type: string
+
+# Least privilege. Only the final tag job is allowed to write.
+permissions:
+  contents: read
+
+# Never run two deploys at once, and never cancel one halfway through.
+concurrency:
+  group: cd-deploy
+  cancel-in-progress: false
+
+env:
+  APP_DIR: /opt/quotes-api
+
+jobs:
+  deploy:
+    name: Deploy to server
+    runs-on: ubuntu-latest
+    env:
+      SERVER_HOST: ${{ vars.SERVER_HOST }}
+      SERVER_USER: ${{ vars.SERVER_USER }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fail fast, BEFORE touching the server. Inputs are passed through env
+      # (never pasted into the script) so a crafted version can't inject shell.
+      - name: Validate inputs and configuration
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version must look like v1.2.3 (got '$VERSION')"; exit 1
+          fi
+          [ -n "$SERVER_HOST" ]     || { echo "::error::Repository variable SERVER_HOST is not set"; exit 1; }
+          [ -n "$SERVER_USER" ]     || { echo "::error::Repository variable SERVER_USER is not set"; exit 1; }
+          [ -n "$SSH_PRIVATE_KEY" ] || { echo "::error::Secret SSH_PRIVATE_KEY is not set"; exit 1; }
+          # The tag is created at the very end; make sure it is still free now,
+          # otherwise we would deploy successfully and then fail to tag.
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $VERSION already exists - pick a new version"; exit 1
+          fi
+          # Every deploy gets a brand-new directory: version + UTC timestamp.
+          echo "RELEASE=${VERSION}-$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Production dependencies only: this is exactly what ships.
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -T 15 -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+          [ -s ~/.ssh/known_hosts ] || { echo "::error::Could not reach $SERVER_HOST:22"; exit 1; }
+          cat > ~/.ssh/config <<EOF
+          Host target
+            HostName $SERVER_HOST
+            User $SERVER_USER
+            IdentityFile ~/.ssh/id_ed25519
+            IdentitiesOnly yes
+            BatchMode yes
+            ConnectTimeout 15
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/config
+          ssh target 'echo "SSH OK as $(whoami) on $(hostname)"'
+
+      # Remember where 'current' points NOW so we can roll back to it.
+      - name: Record previous release
+        run: |
+          PREV=$(ssh target "readlink -f $APP_DIR/current" || true)
+          echo "PREV_RELEASE=$PREV" >> "$GITHUB_ENV"
+          echo "Previous release: ${PREV:-<none>}"
+
+      - name: Upload new release
+        run: |
+          ssh target "mkdir -p $APP_DIR/releases/$RELEASE"
+          rsync -az --delete \
+            --exclude='.git' --exclude='.github' \
+            --exclude='tests' --exclude='coverage' --exclude='eslint.config.js' \
+            ./ "target:$APP_DIR/releases/$RELEASE/"
+
+      # ln + mv -T: the symlink is swapped in ONE atomic rename, so there is no
+      # moment where 'current' is missing. Nothing is ever overwritten in place.
+      - name: Switch symlink, restart service, reload nginx
+        run: |
+          echo "SWITCHED=true" >> "$GITHUB_ENV"
+          ssh target "cd $APP_DIR && ln -sfn releases/$RELEASE current.tmp && mv -Tf current.tmp current"
+          ssh target "sudo -n systemctl restart quotes-api && sudo -n nginx -s reload"
+
+      # Goes through nginx on port 80, exactly like a real user would.
+      - name: Health check
+        run: |
+          for i in $(seq 1 10); do
+            health=$(curl -fsS --max-time 5 "http://$SERVER_HOST/health" 2>/dev/null || true)
+            version=$(curl -fsS --max-time 5 "http://$SERVER_HOST/api/version" 2>/dev/null || true)
+            if echo "$health" | grep -q '"status":"ok"' && echo "$version" | grep -q '"name":"quotes-api"'; then
+              echo "Healthy on attempt $i: $health $version"
+              exit 0
+            fi
+            echo "Attempt $i/10 not healthy yet (health='$health') - retrying in 3s"
+            sleep 3
+          done
+          echo "::error::Health check failed after 10 attempts"
+          exit 1
+
+      # Runs ONLY if something failed after the switch happened.
+      - name: Roll back to previous release
+        if: failure() && env.SWITCHED == 'true'
+        run: |
+          if [ -z "$PREV_RELEASE" ]; then
+            echo "::error::No previous release recorded - cannot roll back"; exit 1
+          fi
+          PREV_NAME=$(basename "$PREV_RELEASE")
+          echo "Rolling back to $PREV_NAME"
+          ssh target "cd $APP_DIR && ln -sfn releases/$PREV_NAME current.tmp && mv -Tf current.tmp current && sudo -n systemctl restart quotes-api"
+          sleep 5
+          curl -fsS --max-time 5 "http://$SERVER_HOST/health" && echo
+          echo "::error::Deploy of $RELEASE FAILED its health check. Rolled back to $PREV_NAME."
+
+      # Housekeeping after success: keep the live release + 4 most recent others.
+      - name: Prune old releases
+        run: |
+          ssh target 'bash -s' -- "$APP_DIR" <<'REMOTE'
+          set -euo pipefail
+          cd "$1/releases"
+          cur=$(basename "$(readlink -f ../current)")
+          ls -1dt */ | sed 's#/$##' | grep -vx "$cur" | tail -n +5 | xargs -r rm -rf --
+          echo "Releases kept:"; ls -1t
+          REMOTE
+
+      - name: Summary
+        run: |
+          {
+            echo "## Deployed ${VERSION}"
+            echo ""
+            echo "- Release dir: \`$APP_DIR/releases/$RELEASE\`"
+            echo "- Previous: \`${PREV_RELEASE:-none}\`"
+            echo "- Check: http://$SERVER_HOST/api/quotes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Only runs if the deploy job (including the health check) fully succeeded.
+  tag:
+    name: Tag release
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release (also creates the git tag)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes
