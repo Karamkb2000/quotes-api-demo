@@ -1,3 +1,4 @@
+const path = require("path");
 const express = require("express");
 const pkg = require("../package.json");
 const { listQuotes, getQuote, randomQuote } = require("./quotes");
@@ -27,6 +28,9 @@ function createApp() {
     if (!quote) return res.status(404).json({ error: "quote not found" });
     res.json(quote);
   });
+
+  // Serve the demo UI (public/index.html). Registered last so API routes win.
+  app.use(express.static(path.join(__dirname, "..", "public")));
 
   return app;
 }
